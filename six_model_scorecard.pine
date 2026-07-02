@@ -1,0 +1,113 @@
+//@version=6
+// Six-model single-stock SCORECARD (Lynch / Piotroski / Minervini / Graham /
+// Buffett / O'Neil) — the screener, not the portfolio strategy.
+//
+// WHAT THIS IS: for the ONE stock on your chart, it grades the six models and
+// prints a combined verdict in a table. Best on a DAILY chart of a liquid stock
+// that has fundamental data (most US names; many NSE/BSE names).
+//
+// WHAT THIS IS NOT: the cross-sectional factor STRATEGY. That ranks a whole
+// universe and holds the top names — impossible on a single Pine chart. It also
+// can't be backtested/validated here; use factor_strategy.py for that.
+//
+// If a fundamental row shows "n/a", TradingView has no such data for this
+// symbol/your plan — the price-based Minervini rows will still work.
+indicator("Six-Model Stock Scorecard", overlay = true)
+
+idxSym   = input.symbol("SP:SPX", "Benchmark index for relative strength")
+pegMax   = input.float(1.5,  "Lynch: max PEG")
+roeMin   = input.float(15.0, "Buffett: min ROE %")
+fMin     = input.int(3,      "Piotroski: min simplified F points (of 4)")
+epsGmin  = input.float(20.0, "O'Neil: min EPS growth %")
+
+// ---------- fundamentals (guarded; na -> shown as n/a) ----------
+roe     = request.financial(syminfo.tickerid, "RETURN_ON_EQUITY",          "FY",  ignore_invalid_symbol = true)
+epsTTM  = request.financial(syminfo.tickerid, "BASIC_EPS",                 "TTM", ignore_invalid_symbol = true)
+epsFY   = request.financial(syminfo.tickerid, "BASIC_EPS",                 "FY",  ignore_invalid_symbol = true)
+bvps    = request.financial(syminfo.tickerid, "BOOK_VALUE_PER_SHARE",      "FY",  ignore_invalid_symbol = true)
+netInc  = request.financial(syminfo.tickerid, "NET_INCOME",                "FY",  ignore_invalid_symbol = true)
+ocf     = request.financial(syminfo.tickerid, "CASH_F_OPERATING_ACTIVITIES","FY", ignore_invalid_symbol = true)
+roa     = request.financial(syminfo.tickerid, "RETURN_ON_ASSETS",          "FY",  ignore_invalid_symbol = true)
+
+// EPS growth from the two most recent distinct annual figures
+epsPrev = ta.valuewhen(ta.change(epsFY) != 0, epsFY, 1)
+epsG    = not na(epsFY) and not na(epsPrev) and epsPrev != 0 ? (epsFY - epsPrev) / math.abs(epsPrev) * 100.0 : na
+
+// ---------- 1. Lynch (PEG) ----------
+pe  = not na(epsTTM) and epsTTM > 0 ? close / epsTTM : na
+peg = not na(pe) and not na(epsG) and epsG != 0 ? pe / epsG : na
+lynchPass = not na(peg) and peg > 0 and peg < pegMax
+
+// ---------- 2. Piotroski (simplified, 4 cleanly-available points) ----------
+roaPrev = ta.valuewhen(ta.change(roa) != 0, roa, 1)
+fPts = (not na(netInc) and netInc > 0 ? 1 : 0) + (not na(ocf) and ocf > 0 ? 1 : 0) + (not na(ocf) and not na(netInc) and ocf > netInc ? 1 : 0) + (not na(roa) and not na(roaPrev) and roa > roaPrev ? 1 : 0)
+piotroskiPass = fPts >= fMin
+
+// ---------- 3. Minervini 7-point trend template (price only) ----------
+sma50  = ta.sma(close, 50)
+sma150 = ta.sma(close, 150)
+sma200 = ta.sma(close, 200)
+hi52   = ta.highest(close, 252)
+lo52   = ta.lowest(close, 252)
+c1 = close > sma150 and close > sma200
+c2 = sma150 > sma200
+c3 = sma200 > sma200[22]
+c4 = sma50 > sma150 and sma50 > sma200
+c5 = close > sma50
+c6 = close >= lo52 * 1.30
+c7 = close >= hi52 * 0.75
+mCount = (c1?1:0)+(c2?1:0)+(c3?1:0)+(c4?1:0)+(c5?1:0)+(c6?1:0)+(c7?1:0)
+minerviniPass = mCount == 7
+
+// ---------- 4. Graham number ----------
+graham = not na(epsTTM) and not na(bvps) and epsTTM > 0 and bvps > 0 ? math.sqrt(22.5 * epsTTM * bvps) : na
+grahamPass = not na(graham) and close < graham
+
+// ---------- 5. Buffett (ROE) ----------
+buffettPass = not na(roe) and roe >= roeMin
+
+// ---------- 6. O'Neil (relative strength + EPS growth + near high) ----------
+stockRet = close / close[252] - 1
+idxClose = request.security(idxSym, timeframe.period, close)
+idxRet   = idxClose / idxClose[252] - 1
+nearHigh = close >= hi52 * 0.80
+oneilPass = not na(epsG) and epsG >= epsGmin and not na(stockRet) and not na(idxRet) and stockRet > idxRet and nearHigh
+
+// ---------- combined verdict (mirrors the screener) ----------
+fundamentalPass = buffettPass and piotroskiPass and (not na(epsG) and epsG >= epsGmin)
+chartPass       = minerviniPass
+cheap           = not na(peg) and peg < pegMax
+verdict = fundamentalPass and chartPass and cheap ? "GOLDEN JACKPOT" : fundamentalPass and chartPass ? "STRONG PICK" : fundamentalPass or chartPass ? "WATCHLIST" : "AVOID"
+vColor  = verdict == "GOLDEN JACKPOT" ? color.new(color.yellow, 0) : verdict == "STRONG PICK" ? color.new(color.green, 0) : verdict == "WATCHLIST" ? color.new(color.orange, 0) : color.new(color.red, 0)
+
+// ---------- render table ----------
+f(x, fmt) => na(x) ? "n/a" : str.tostring(x, fmt)
+tick(b)   => b ? "PASS" : "fail"
+tcol(b)   => b ? color.new(color.green, 0) : color.new(color.red, 0)
+
+var table t = table.new(position.top_right, 3, 8, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "Model",     text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 1, 0, "Value",     text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 2, 0, "Result",    text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 0, 1, "Lynch PEG",     text_color = color.white)
+    table.cell(t, 1, 1, f(peg, "#.##"),  text_color = color.white)
+    table.cell(t, 2, 1, tick(lynchPass), bgcolor = tcol(lynchPass), text_color = color.white)
+    table.cell(t, 0, 2, "Piotroski F",   text_color = color.white)
+    table.cell(t, 1, 2, str.tostring(fPts) + "/4", text_color = color.white)
+    table.cell(t, 2, 2, tick(piotroskiPass), bgcolor = tcol(piotroskiPass), text_color = color.white)
+    table.cell(t, 0, 3, "Minervini",     text_color = color.white)
+    table.cell(t, 1, 3, str.tostring(mCount) + "/7", text_color = color.white)
+    table.cell(t, 2, 3, tick(minerviniPass), bgcolor = tcol(minerviniPass), text_color = color.white)
+    table.cell(t, 0, 4, "Graham",        text_color = color.white)
+    table.cell(t, 1, 4, f(graham, "#.#"),text_color = color.white)
+    table.cell(t, 2, 4, tick(grahamPass), bgcolor = tcol(grahamPass), text_color = color.white)
+    table.cell(t, 0, 5, "Buffett ROE",   text_color = color.white)
+    table.cell(t, 1, 5, f(roe, "#.#") + "%", text_color = color.white)
+    table.cell(t, 2, 5, tick(buffettPass), bgcolor = tcol(buffettPass), text_color = color.white)
+    table.cell(t, 0, 6, "O'Neil",        text_color = color.white)
+    table.cell(t, 1, 6, f(epsG, "#.#") + "% eps", text_color = color.white)
+    table.cell(t, 2, 6, tick(oneilPass), bgcolor = tcol(oneilPass), text_color = color.white)
+    table.cell(t, 0, 7, "VERDICT",  text_color = color.black, bgcolor = vColor)
+    table.cell(t, 1, 7, verdict,    text_color = color.black, bgcolor = vColor)
+    table.cell(t, 2, 7, "",         bgcolor = vColor)
