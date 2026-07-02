@@ -1,0 +1,87 @@
+//@version=6
+// BTC 15m flow-imbalance mean reversion — Pine port of btc_mean_reversion.py
+//
+// Use on BINANCE:BTCUSDT, 15m chart. This reproduces the strategy and the
+// basic backtest only. The validation harness (walk-forward, holdout, ±25%
+// sweep, Monte Carlo) cannot be expressed in Pine — TradingView's Strategy
+// Tester is a single in-sample run, so treat its results accordingly.
+//
+// Flow imbalance: TradingView has no taker buy/sell volume. Where 1-minute
+// intrabar data is available this script sums up-volume vs down-volume from
+// 1m bars (decent proxy); on older history where intrabar data runs out it
+// falls back to candle-body pressure (close-open)/(high-low) (weaker proxy).
+strategy("BTC 15m Flow-Imbalance Mean Reversion",
+     overlay = false,
+     initial_capital = 100000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.075,             // 7.5 bps per side (fee + slippage)
+     calc_on_every_tick = false,
+     process_orders_on_close = false)      // signal on close -> filled next bar open
+
+// ---- inputs (defaults = Python Params; walk-forward consensus was
+// ---- anchor=96, z_entry=1.5, imb_entry=0.5 on the synthetic run) ----
+anchorLen  = input.int(96,    "Anchor EMA length (bars)")
+stretchWin = input.int(192,   "Stretch z-score window")
+imbWin     = input.int(96,    "Imbalance z-score window")
+zEntry     = input.float(2.0, "Stretch z entry", step = 0.1)
+imbEntry   = input.float(1.0, "Imbalance z entry", step = 0.1)
+zExit      = input.float(0.0, "Stretch z exit (revert through)", step = 0.1)
+zStop      = input.float(4.0, "Stretch z blow-out stop", step = 0.1)
+maxHold    = input.int(96,    "Time stop (bars)")
+targetVol  = input.float(0.40, "Annualized vol target", step = 0.05)
+volWin     = input.int(96,    "Realized-vol window")
+lowerTf    = input.timeframe("1", "Lower TF for up/down volume")
+
+BARS_PER_YEAR = 35040.0  // 15m bars, 24/7
+
+// ---- flow imbalance ----
+upDn = request.security_lower_tf(syminfo.tickerid, lowerTf,
+     [close >= open ? volume : 0.0, close < open ? volume : 0.0])
+buyVol  = array.size(upDn.get(0)) > 0 ? array.sum(upDn.get(0)) : na
+sellVol = array.size(upDn.get(1)) > 0 ? array.sum(upDn.get(1)) : na
+intrabarImb = (buyVol + sellVol) > 0 ? (buyVol - sellVol) / (buyVol + sellVol) : 0.0
+bodyImb = (high - low) > 0 ? (close - open) / (high - low) : 0.0
+imbRaw = na(intrabarImb) ? bodyImb : intrabarImb
+
+imbMu = ta.sma(imbRaw, imbWin)
+imbSd = ta.stdev(imbRaw, imbWin)
+imbZ  = imbSd > 0 ? (imbRaw - imbMu) / imbSd : na
+
+// ---- price stretch from moving anchor ----
+anchor   = ta.ema(close, anchorLen)
+dev      = close - anchor
+devSd    = ta.stdev(dev, stretchWin)
+stretchZ = devSd > 0 ? dev / devSd : na
+
+// ---- vol-targeted sizing, capped at 1x equity ----
+ret = close / close[1] - 1
+rv  = ta.stdev(ret, volWin) * math.sqrt(BARS_PER_YEAR)
+sizeFrac = rv > 0 ? math.min(1.0, targetVol / rv) : 0.0
+qty = sizeFrac * strategy.equity / close
+
+// ---- state machine ----
+flat = strategy.position_size == 0
+barsHeld = strategy.opentrades > 0 ?
+     bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1) : 0
+
+longSig  = flat and not na(stretchZ) and not na(imbZ) and stretchZ <= -zEntry and imbZ <= -imbEntry
+shortSig = flat and not na(stretchZ) and not na(imbZ) and stretchZ >=  zEntry and imbZ >=  imbEntry
+
+if longSig
+    strategy.entry("L", strategy.long, qty = qty)
+if shortSig
+    strategy.entry("S", strategy.short, qty = qty)
+
+if strategy.position_size > 0 and (stretchZ >= -zExit or stretchZ <= -zStop or barsHeld >= maxHold)
+    strategy.close("L", comment = stretchZ >= -zExit ? "revert" : stretchZ <= -zStop ? "stop" : "time")
+if strategy.position_size < 0 and (stretchZ <= zExit or stretchZ >= zStop or barsHeld >= maxHold)
+    strategy.close("S", comment = stretchZ <= zExit ? "revert" : stretchZ >= zStop ? "stop" : "time")
+
+// ---- plots ----
+plot(stretchZ, "Stretch z", color = color.blue)
+plot(imbZ, "Imbalance z", color = color.orange)
+hline(0)
+hline(2.0,  "entry",  color = color.gray, linestyle = hline.style_dotted)
+hline(-2.0, "-entry", color = color.gray, linestyle = hline.style_dotted)
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 90) :
+     strategy.position_size < 0 ? color.new(color.red, 90) : na)
