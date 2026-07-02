@@ -35,11 +35,12 @@ lowerTf    = input.timeframe("1", "Lower TF for up/down volume")
 BARS_PER_YEAR = 35040.0  // 15m bars, 24/7
 
 // ---- flow imbalance ----
-upDn = request.security_lower_tf(syminfo.tickerid, lowerTf,
+[upArr, dnArr] = request.security_lower_tf(syminfo.tickerid, lowerTf,
      [close >= open ? volume : 0.0, close < open ? volume : 0.0])
-buyVol  = array.size(upDn.get(0)) > 0 ? array.sum(upDn.get(0)) : na
-sellVol = array.size(upDn.get(1)) > 0 ? array.sum(upDn.get(1)) : na
-intrabarImb = (buyVol + sellVol) > 0 ? (buyVol - sellVol) / (buyVol + sellVol) : 0.0
+buyVol  = array.size(upArr) > 0 ? array.sum(upArr) : na
+sellVol = array.size(dnArr) > 0 ? array.sum(dnArr) : na
+totVol = buyVol + sellVol
+intrabarImb = not na(totVol) and totVol > 0 ? (buyVol - sellVol) / totVol : na
 bodyImb = (high - low) > 0 ? (close - open) / (high - low) : 0.0
 imbRaw = na(intrabarImb) ? bodyImb : intrabarImb
 
@@ -56,7 +57,7 @@ stretchZ = devSd > 0 ? dev / devSd : na
 // ---- vol-targeted sizing, capped at 1x equity ----
 ret = close / close[1] - 1
 rv  = ta.stdev(ret, volWin) * math.sqrt(BARS_PER_YEAR)
-sizeFrac = rv > 0 ? math.min(1.0, targetVol / rv) : 0.0
+sizeFrac = not na(rv) and rv > 0 ? math.min(1.0, targetVol / rv) : 0.0
 qty = sizeFrac * strategy.equity / close
 
 // ---- state machine ----
