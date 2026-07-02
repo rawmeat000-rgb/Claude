@@ -1,0 +1,101 @@
+//@version=6
+// Dual Momentum rotation (relative + absolute) — Pine port of dual_momentum.py
+//
+// USE ON A **DAILY (1D)** CHART of one of the four coins (default BINANCE:BTCUSDT).
+//
+// HOW IT WORKS: every rebalance it ranks BTC/ETH/SOL/XRP by blended 30/90/180d
+// momentum. The full system holds the strongest coin — unless that coin is
+// below its own trend SMA, in which case it holds CASH (bear circuit breaker).
+//
+// HONEST LIMITATION: Pine can only TRADE the chart's own symbol. The Strategy
+// Tester therefore shows ONE LEG of the rotation: long this chart's coin when
+// it is the ranked leader and in an uptrend, flat otherwise. The table (top
+// right) shows the FULL rotation decision — all four scores and what the
+// complete system would hold right now. For the full portfolio backtest use
+// dual_momentum.py. To approximate it on TradingView, run this script on each
+// of the four coins' charts and combine mentally.
+strategy("Dual Momentum Rotation (chart-symbol leg)",
+     overlay = true,
+     initial_capital = 100000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.15,              // 15 bps per side (fee + slippage)
+     calc_on_every_tick = false,
+     process_orders_on_close = false)      // decide on close -> fill next day open
+
+// ---- inputs ----
+symBTC   = input.symbol("BINANCE:BTCUSDT", "Asset 1")
+symETH   = input.symbol("BINANCE:ETHUSDT", "Asset 2")
+symSOL   = input.symbol("BINANCE:SOLUSDT", "Asset 3")
+symXRP   = input.symbol("BINANCE:XRPUSDT", "Asset 4")
+thisSym  = input.string("BTC", "Which asset is THIS chart?", options = ["BTC", "ETH", "SOL", "XRP"])
+lb1      = input.int(30,  "Momentum lookback 1 (days)")
+lb2      = input.int(90,  "Momentum lookback 2 (days)")
+lb3      = input.int(180, "Momentum lookback 3 (days)")
+trendLen = input.int(100, "Absolute-momentum SMA (days)")
+rebDays  = input.int(7,   "Rebalance every N bars")
+
+// ---- per-asset momentum + trend gate (computed in each symbol's context) ----
+momBTC = request.security(symBTC, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3)
+momETH = request.security(symETH, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3)
+momSOL = request.security(symSOL, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3)
+momXRP = request.security(symXRP, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3)
+
+okBTC = request.security(symBTC, timeframe.period, close > ta.sma(close, trendLen))
+okETH = request.security(symETH, timeframe.period, close > ta.sma(close, trendLen))
+okSOL = request.security(symSOL, timeframe.period, close > ta.sma(close, trendLen))
+okXRP = request.security(symXRP, timeframe.period, close > ta.sma(close, trendLen))
+
+// na-safe scores for ranking (na -> very low so it can't win)
+sBTC = nz(momBTC, -1e9)
+sETH = nz(momETH, -1e9)
+sSOL = nz(momSOL, -1e9)
+sXRP = nz(momXRP, -1e9)
+topScore = math.max(sBTC, math.max(sETH, math.max(sSOL, sXRP)))
+
+// full-rotation decision: leader name, and CASH if leader fails its gate
+leader = topScore == sBTC ? "BTC" : topScore == sETH ? "ETH" : topScore == sSOL ? "SOL" : "XRP"
+leaderOk = leader == "BTC" ? okBTC : leader == "ETH" ? okETH : leader == "SOL" ? okSOL : okXRP
+rotationHolds = topScore <= -1e8 ? "warming up" : leaderOk ? leader : "CASH"
+
+// ---- this chart's leg ----
+myMom = thisSym == "BTC" ? momBTC : thisSym == "ETH" ? momETH : thisSym == "SOL" ? momSOL : momXRP
+myOk  = thisSym == "BTC" ? okBTC  : thisSym == "ETH" ? okETH  : thisSym == "SOL" ? okSOL  : okXRP
+iAmLeader = leader == thisSym and topScore > -1e8
+
+// weekly rebalance decision (state held between rebalances)
+var bool wantLong = false
+if bar_index % rebDays == 0
+    wantLong := iAmLeader and myOk and not na(myMom)
+
+if wantLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long, qty = strategy.equity / close)
+if not wantLong and strategy.position_size > 0
+    strategy.close("L", comment = iAmLeader ? "trend off -> cash" : "lost leadership")
+
+// ---- visuals ----
+plot(ta.sma(close, trendLen), "Trend SMA", color = color.new(color.red, 30))
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na)
+
+fmtPct(x) => na(x) ? "n/a" : str.tostring(x * 100, "#.#") + "%"
+gcol(b)   => b ? color.new(color.green, 0) : color.new(color.red, 0)
+
+var table t = table.new(position.top_right, 4, 6, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "Asset",  text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 1, 0, "Mom",    text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 2, 0, "Trend",  text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 3, 0, "Pick",   text_color = color.white, bgcolor = color.new(color.gray, 0))
+    names = array.from("BTC", "ETH", "SOL", "XRP")
+    moms  = array.from(momBTC, momETH, momSOL, momXRP)
+    oks   = array.from(okBTC, okETH, okSOL, okXRP)
+    for i = 0 to 3
+        nm = array.get(names, i)
+        table.cell(t, 0, i + 1, nm, text_color = color.white)
+        table.cell(t, 1, i + 1, fmtPct(array.get(moms, i)), text_color = color.white)
+        table.cell(t, 2, i + 1, array.get(oks, i) ? "UP" : "down", bgcolor = gcol(array.get(oks, i)), text_color = color.white)
+        table.cell(t, 3, i + 1, rotationHolds == nm ? "<== HOLD" : "", text_color = color.yellow)
+    vcol = rotationHolds == "CASH" ? color.new(color.orange, 0) : color.new(color.green, 0)
+    table.cell(t, 0, 5, "ROTATION", text_color = color.black, bgcolor = vcol)
+    table.cell(t, 1, 5, "HOLDS:",   text_color = color.black, bgcolor = vcol)
+    table.cell(t, 2, 5, rotationHolds, text_color = color.black, bgcolor = vcol)
+    table.cell(t, 3, 5, timeframe.period == "D" ? "" : "USE 1D CHART!", text_color = color.white, bgcolor = color.new(color.red, 0))

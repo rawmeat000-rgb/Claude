@@ -1,0 +1,109 @@
+//@version=6
+// Dual Momentum rotation for STOCKS / ETFs — equities version of dual_momentum.pine
+//
+// USE ON A **DAILY (1D)** CHART of one of your chosen symbols (default: SPY).
+//
+// HOW IT WORKS (classic Antonacci "Global Equity Momentum", generalized):
+// every rebalance it ranks four risk assets by blended 3/6/12-month momentum.
+// The full system holds the strongest one — unless that leader is below its
+// own 200-day SMA (absolute-momentum gate), in which case it retreats to the
+// DEFENSIVE asset (bonds by default; that's the bear-market circuit breaker).
+//
+// Any tickers work: swap the inputs for AAPL/MSFT/NVDA/etc. Note honestly that
+// rotating a few individual stocks is far noisier than broad ETFs — single
+// companies gap on earnings and idiosyncratic news that momentum can't see.
+// The classic, evidence-backed form uses broad index ETFs.
+//
+// HONEST LIMITATION: Pine can only TRADE the chart's own symbol, so the
+// Strategy Tester shows ONE LEG of the rotation (long this symbol when it's
+// the gated leader, flat otherwise). The top-right table always shows the FULL
+// rotation decision. Run the script on each symbol's chart to see every leg.
+strategy("Dual Momentum Rotation — Stocks/ETFs",
+     overlay = true,
+     initial_capital = 100000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,              // 5 bps per side (spread + slippage)
+     calc_on_every_tick = false,
+     process_orders_on_close = false)      // decide on close -> fill next day open
+
+// ---- inputs: pick any four risk assets + one defensive ----
+symA = input.symbol("AMEX:SPY",    "Risk asset 1")
+symB = input.symbol("NASDAQ:QQQ", "Risk asset 2")
+symC = input.symbol("AMEX:IWM",   "Risk asset 3")
+symD = input.symbol("AMEX:EFA",   "Risk asset 4")
+symZ = input.symbol("AMEX:AGG", "Defensive asset (bonds/cash proxy)")
+thisSlot = input.string("Risk 1", "Which slot is THIS chart?",
+     options = ["Risk 1", "Risk 2", "Risk 3", "Risk 4", "Defensive"])
+lb1      = input.int(63,  "Momentum lookback 1 (trading days ~3m)")
+lb2      = input.int(126, "Momentum lookback 2 (~6m)")
+lb3      = input.int(252, "Momentum lookback 3 (~12m)")
+trendLen = input.int(200, "Absolute-momentum SMA (days)")
+rebDays  = input.int(21,  "Rebalance every N bars (~monthly)")
+
+// ---- per-asset blended momentum + trend gate ----
+momA = request.security(symA, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3, ignore_invalid_symbol = true)
+momB = request.security(symB, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3, ignore_invalid_symbol = true)
+momC = request.security(symC, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3, ignore_invalid_symbol = true)
+momD = request.security(symD, timeframe.period, (close / close[lb1] - 1 + close / close[lb2] - 1 + close / close[lb3] - 1) / 3, ignore_invalid_symbol = true)
+
+okA = request.security(symA, timeframe.period, close > ta.sma(close, trendLen), ignore_invalid_symbol = true)
+okB = request.security(symB, timeframe.period, close > ta.sma(close, trendLen), ignore_invalid_symbol = true)
+okC = request.security(symC, timeframe.period, close > ta.sma(close, trendLen), ignore_invalid_symbol = true)
+okD = request.security(symD, timeframe.period, close > ta.sma(close, trendLen), ignore_invalid_symbol = true)
+
+// na-safe scores (na -> very low so an unlisted/young symbol can't win)
+sA = nz(momA, -1e9)
+sB = nz(momB, -1e9)
+sC = nz(momC, -1e9)
+sD = nz(momD, -1e9)
+topScore = math.max(sA, math.max(sB, math.max(sC, sD)))
+
+leader   = topScore == sA ? "Risk 1" : topScore == sB ? "Risk 2" : topScore == sC ? "Risk 3" : "Risk 4"
+leaderOk = leader == "Risk 1" ? okA : leader == "Risk 2" ? okB : leader == "Risk 3" ? okC : okD
+warming  = topScore <= -1e8
+rotationHolds = warming ? "warming up" : leaderOk ? leader : "Defensive"
+
+// ---- this chart's leg ----
+iAmLeader   = leader == thisSlot and not warming
+iAmDefensive = thisSlot == "Defensive"
+
+var bool wantLong = false
+if bar_index % rebDays == 0
+    wantLong := iAmDefensive ? rotationHolds == "Defensive" : (iAmLeader and leaderOk)
+
+if wantLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long, qty = strategy.equity / close)
+if not wantLong and strategy.position_size > 0
+    strategy.close("L", comment = iAmDefensive ? "risk back on" : iAmLeader ? "gate off -> defensive" : "lost leadership")
+
+// ---- visuals ----
+plot(ta.sma(close, trendLen), "Trend SMA", color = color.new(color.red, 30))
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na)
+
+fmtPct(x) => na(x) ? "n/a" : str.tostring(x * 100, "#.#") + "%"
+gcol(b)   => b ? color.new(color.green, 0) : color.new(color.red, 0)
+shortName(simple string s) => str.contains(s, ":") ? array.get(str.split(s, ":"), 1) : s
+
+var table t = table.new(position.top_right, 4, 8, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "Slot",   text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 1, 0, "Mom",    text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 2, 0, "Trend",  text_color = color.white, bgcolor = color.new(color.gray, 0))
+    table.cell(t, 3, 0, "Pick",   text_color = color.white, bgcolor = color.new(color.gray, 0))
+    slots = array.from("Risk 1", "Risk 2", "Risk 3", "Risk 4")
+    names = array.from(shortName(symA), shortName(symB), shortName(symC), shortName(symD))
+    moms  = array.from(momA, momB, momC, momD)
+    oks   = array.from(okA, okB, okC, okD)
+    for i = 0 to 3
+        table.cell(t, 0, i + 1, array.get(names, i), text_color = color.white)
+        table.cell(t, 1, i + 1, fmtPct(array.get(moms, i)), text_color = color.white)
+        table.cell(t, 2, i + 1, array.get(oks, i) ? "UP" : "down", bgcolor = gcol(array.get(oks, i)), text_color = color.white)
+        table.cell(t, 3, i + 1, rotationHolds == array.get(slots, i) ? "<== HOLD" : "", text_color = color.yellow)
+    table.cell(t, 0, 5, shortName(symZ) + " (def)", text_color = color.white)
+    table.cell(t, 3, 5, rotationHolds == "Defensive" ? "<== HOLD" : "", text_color = color.yellow)
+    holdName = rotationHolds == "Defensive" ? shortName(symZ) : rotationHolds == "warming up" ? "warming up" : array.get(names, rotationHolds == "Risk 1" ? 0 : rotationHolds == "Risk 2" ? 1 : rotationHolds == "Risk 3" ? 2 : 3)
+    vcol = rotationHolds == "Defensive" ? color.new(color.orange, 0) : color.new(color.green, 0)
+    table.cell(t, 0, 6, "ROTATION", text_color = color.black, bgcolor = vcol)
+    table.cell(t, 1, 6, "HOLDS:",   text_color = color.black, bgcolor = vcol)
+    table.cell(t, 2, 6, holdName,   text_color = color.black, bgcolor = vcol)
+    table.cell(t, 3, 6, timeframe.period == "D" ? "" : "USE 1D CHART!", text_color = color.white, bgcolor = color.new(color.red, 0))
